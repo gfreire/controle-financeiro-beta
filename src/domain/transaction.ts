@@ -113,6 +113,14 @@ export type CreateTransferInput = BaseInput & {
   destinationAccountId: string
 }
 
+export type CreateInvoicePaymentInput = {
+  date: string
+  amount: number
+  description?: string
+  originAccountId: string
+  cardAccountId: string
+}
+
 /* =========================
    UPDATE INPUT
 ========================= */
@@ -198,5 +206,29 @@ export function validateCreateTransaction(
     if (input.originAccountId === input.destinationAccountId) {
       throw new Error('Contas devem ser diferentes')
     }
+  }
+}
+
+export function validateCreateInvoicePayment(
+  input: CreateInvoicePaymentInput
+) {
+  if (!input.date) {
+    throw new Error('Data é obrigatória')
+  }
+
+  if (input.amount <= 0) {
+    throw new Error('Valor deve ser maior que zero')
+  }
+
+  if (!input.originAccountId) {
+    throw new Error('Conta de origem é obrigatória')
+  }
+
+  if (!input.cardAccountId) {
+    throw new Error('Conta do cartão é obrigatória')
+  }
+
+  if (input.originAccountId === input.cardAccountId) {
+    throw new Error('Contas devem ser diferentes')
   }
 }

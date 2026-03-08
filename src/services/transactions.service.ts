@@ -1,222 +1,18 @@
 import { supabase } from '@/lib/supabase'
 import {
+  CreateExpenseInput,
+  CreateIncomeInput,
+  CreateInvoicePaymentInput,
   CreateTransactionInput,
+  CreateTransferInput,
+  TimelineItem,
   UpdateTransactionInput,
+  validateCreateInvoicePayment,
   validateCreateTransaction,
   validateUpdateTransaction,
 } from '@/domain/transaction'
-import { TimelineItem } from '@/domain/transaction'
 import Decimal from 'decimal.js'
 import { normalizeText } from '@/utils/normalize'
-
-export async function createTransaction(
-  input: CreateTransactionInput
-): Promise<void> {
-  validateCreateTransaction(input)
-
-  if (input.type === 'TRANSFERENCIA') {
-    return createTransfer(input)
-  }
-
-  if (input.type === 'ENTRADA') {
-    return createIncome(input)
-  }
-
-  if (input.type === 'SAIDA') {
-    if (input.paymentMethod === 'CARTAO_CREDITO') {
-      return createCardPurchase(input)
-    }
-
-    return createCashExpense(input)
-  }
-
-  throw new Error('Tipo inválido')
-}
-
-/* =========================
-   ENTRADA
-========================= */
-
-async function createIncome(
-  input: Extract<CreateTransactionInput, { type: 'ENTRADA' }>
-) {
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
-
-  const { error } = await supabase.from('movimentacoes').insert({
-    tipo: 'ENTRADA',
-    valor: input.amount,
-    data: input.date,
-    descricao: normalizeText(input.description),
-    conta_destino_id: input.destinationAccountId,
-    conta_origem_id: null,
-    categoria_id: input.categoryId ?? null,
-    subcategoria_id: null,
-    user_id: userId,
-  })
-
-  if (error) throw new Error('Erro ao criar entrada')
-}
-
-/* =========================
-   SAÍDA DINHEIRO / CONTA
-========================= */
-
-async function createCashExpense(
-  input: Extract<CreateTransactionInput, { type: 'SAIDA' }>
-) {
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
-
-  const { error } = await supabase.from('movimentacoes').insert({
-    tipo: 'SAIDA',
-    valor: input.amount,
-    data: input.date,
-    descricao: normalizeText(input.description),
-    conta_origem_id: input.originAccountId,
-    conta_destino_id: null,
-    categoria_id: input.categoryId ?? null,
-    subcategoria_id: input.subcategoryId ?? null,
-    user_id: userId,
-  })
-
-  if (error) throw new Error('Erro ao criar saída')
-}
-
-/* =========================
-   TRANSFERÊNCIA
-========================= */
-
-async function createTransfer(
-  input: Extract<CreateTransactionInput, { type: 'TRANSFERENCIA' }>
-) {
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
-
-  const { error } = await supabase.from('movimentacoes').insert({
-    tipo: 'TRANSFERENCIA',
-    valor: input.amount,
-    data: input.date,
-    descricao: normalizeText(input.description),
-    conta_origem_id: input.originAccountId,
-    conta_destino_id: input.destinationAccountId,
-    categoria_id: null,
-    subcategoria_id: null,
-    user_id: userId,
-  })
-
-  if (error) throw new Error('Erro ao criar transferência')
-}
-
-/* =========================
-   CARTÃO PARCELADO
-========================= */
-
-async function createCardPurchase(
-  input: Extract<
-    CreateTransactionInput,
-    { type: 'SAIDA'; paymentMethod: 'CARTAO_CREDITO' }
-  >
-) {
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
-
-  const {
-    amount,
-    date,
-    description,
-    originAccountId,
-    categoryId,
-    subcategoryId,
-    installments,
-    firstInstallmentMonth,
-    parcelValues,
-  } = input
-
-  if (!installments || installments < 1) {
-    throw new Error('Número de parcelas inválido')
-  }
-
-  if (!firstInstallmentMonth) {
-    throw new Error('Mês da primeira parcela obrigatório')
-  }
-
-  if (!parcelValues || parcelValues.length !== installments) {
-    throw new Error('Parcelas inválidas')
-  }
-
-  const totalFromParcels = parcelValues.reduce(
-    (sum: Decimal, v) => sum.plus(new Decimal(v)),
-    new Decimal(0)
-  )
-
-  if (!totalFromParcels.equals(new Decimal(amount))) {
-    throw new Error(
-      'Soma das parcelas diferente do valor total'
-    )
-  }
-
-  /* 1️⃣ Cria registro principal da compra */
-  const { data: purchase, error: purchaseError } =
-    await supabase
-      .from('compras_cartao')
-      .insert({
-        conta_cartao_id: originAccountId,
-        data_compra: date,
-        descricao: normalizeText(description) ?? '',
-        valor_total: amount,
-        numero_parcelas: installments,
-        categoria_id: categoryId ?? null,
-        subcategoria_id: subcategoryId ?? null,
-        user_id: userId,
-      })
-      .select()
-      .single()
-
-  if (purchaseError || !purchase) {
-    throw new Error('Erro ao criar compra no cartão')
-  }
-
-  /* 2️⃣ Gera parcelas usando valores vindos do FORM */
-  const [year, month] = firstInstallmentMonth
-    .split('-')
-    .map(Number)
-
-  const parcels = parcelValues.map((value, index) => {
-    const competence = new Date(
-      year,
-      month - 1 + index,
-      1
-    )
-
-    const formatted = `${competence.getFullYear()}-${String(
-      competence.getMonth() + 1
-    ).padStart(2, '0')}-01`
-
-    return {
-      compra_cartao_id: purchase.id,
-      competencia: formatted,
-      valor: value,
-      user_id: userId,
-    }
-  })
-
-  const { error: parcelError } = await supabase
-    .from('parcelas_cartao')
-    .insert(parcels)
-
-  if (parcelError) {
-    throw new Error('Erro ao gerar parcelas')
-  }
-}
-
-/* =========================
-   TIMELINE (VIEW)
-========================= */
 
 type DBTimelineRow = {
   id: string
@@ -225,17 +21,31 @@ type DBTimelineRow = {
   amount: number | string
   date: string
   competence: string | null
-
   origin_account_name: string | null
   origin_account_type: string | null
-
   destination_account_name: string | null
   destination_account_type: string | null
-
   category_name: string | null
   subcategory_name: string | null
-
   installments: number | null
+}
+
+type CardParcelaRow = {
+  compra_cartao_id: string
+  competencia: string
+  valor: number
+  user_id: string
+}
+
+async function getUserId(): Promise<string> {
+  const { data: userData } = await supabase.auth.getUser()
+  const userId = userData.user?.id
+
+  if (!userId) {
+    throw new Error('Usuário não autenticado')
+  }
+
+  return userId
 }
 
 function mapTimelineRow(row: DBTimelineRow): TimelineItem {
@@ -256,10 +66,292 @@ function mapTimelineRow(row: DBTimelineRow): TimelineItem {
   }
 }
 
+function buildCardParcels(params: {
+  purchaseId: string
+  userId: string
+  firstInstallmentMonth: string
+  parcelValues: number[]
+}): CardParcelaRow[] {
+  const { purchaseId, userId, firstInstallmentMonth, parcelValues } = params
+  const [year, month] = firstInstallmentMonth.split('-').map(Number)
+
+  return parcelValues.map((value, index) => {
+    const competence = new Date(year, month - 1 + index, 1)
+
+    const formatted = `${competence.getFullYear()}-${String(
+      competence.getMonth() + 1
+    ).padStart(2, '0')}-01`
+
+    return {
+      compra_cartao_id: purchaseId,
+      competencia: formatted,
+      valor: value,
+      user_id: userId,
+    }
+  })
+}
+
+function parseFirstInstallmentMonthFromDate(date: string): string {
+  const d = new Date(date)
+  const year = d.getFullYear()
+  const month = String(d.getMonth() + 1).padStart(2, '0')
+  return `${year}-${month}`
+}
+
+function validateParcelsSum(amount: number, parcelValues: number[]): void {
+  const totalFromParcels = parcelValues.reduce(
+    (sum: Decimal, v) => sum.plus(new Decimal(v)),
+    new Decimal(0)
+  )
+
+  if (!totalFromParcels.equals(new Decimal(amount))) {
+    throw new Error('Soma das parcelas diferente do valor total')
+  }
+}
+
+async function createCardPurchaseInternal(params: {
+  userId: string
+  amount: number
+  date: string
+  description?: string
+  cardAccountId: string
+  categoryId?: string | null
+  subcategoryId?: string | null
+  installments: number
+  firstInstallmentMonth: string
+  parcelValues: number[]
+}): Promise<void> {
+  const {
+    userId,
+    amount,
+    date,
+    description,
+    cardAccountId,
+    categoryId,
+    subcategoryId,
+    installments,
+    firstInstallmentMonth,
+    parcelValues,
+  } = params
+
+  if (!installments || installments < 1) {
+    throw new Error('Número de parcelas inválido')
+  }
+
+  if (!firstInstallmentMonth) {
+    throw new Error('Mês da primeira parcela obrigatório')
+  }
+
+  if (!parcelValues || parcelValues.length !== installments) {
+    throw new Error('Parcelas inválidas')
+  }
+
+  validateParcelsSum(amount, parcelValues)
+
+  const { data: purchase, error: purchaseError } = await supabase
+    .from('compras_cartao')
+    .insert({
+      conta_cartao_id: cardAccountId,
+      data_compra: date,
+      descricao: normalizeText(description) ?? '',
+      valor_total: amount,
+      numero_parcelas: installments,
+      categoria_id: categoryId ?? null,
+      subcategoria_id: subcategoryId ?? null,
+      user_id: userId,
+    })
+    .select('id')
+    .single()
+
+  if (purchaseError || !purchase) {
+    throw new Error('Erro ao criar compra no cartão')
+  }
+
+  const parcels = buildCardParcels({
+    purchaseId: purchase.id,
+    userId,
+    firstInstallmentMonth,
+    parcelValues,
+  })
+
+  const { error: parcelError } = await supabase
+    .from('parcelas_cartao')
+    .insert(parcels)
+
+  if (parcelError) {
+    throw new Error('Erro ao gerar parcelas')
+  }
+}
+
+export async function createExpense(
+  input: Extract<
+    CreateExpenseInput,
+    { type: 'SAIDA'; paymentMethod: 'DINHEIRO' | 'CONTA_CORRENTE' }
+  >
+): Promise<void> {
+  validateCreateTransaction(input)
+
+  const userId = await getUserId()
+
+  const { error } = await supabase.from('movimentacoes').insert({
+    tipo: 'SAIDA',
+    valor: input.amount,
+    data: input.date,
+    descricao: normalizeText(input.description),
+    conta_origem_id: input.originAccountId,
+    conta_destino_id: null,
+    categoria_id: input.categoryId ?? null,
+    subcategoria_id: input.subcategoryId ?? null,
+    user_id: userId,
+  })
+
+  if (error) throw new Error('Erro ao criar saída')
+}
+
+export async function createIncome(
+  input: CreateIncomeInput
+): Promise<void> {
+  validateCreateTransaction(input)
+
+  const userId = await getUserId()
+
+  const { error } = await supabase.from('movimentacoes').insert({
+    tipo: 'ENTRADA',
+    valor: input.amount,
+    data: input.date,
+    descricao: normalizeText(input.description),
+    conta_destino_id: input.destinationAccountId,
+    conta_origem_id: null,
+    categoria_id: input.categoryId ?? null,
+    subcategoria_id: null,
+    user_id: userId,
+  })
+
+  if (error) throw new Error('Erro ao criar entrada')
+}
+
+export async function createCreditPurchase(
+  input: Extract<
+    CreateExpenseInput,
+    { type: 'SAIDA'; paymentMethod: 'CARTAO_CREDITO' }
+  >
+): Promise<void> {
+  validateCreateTransaction(input)
+
+  const userId = await getUserId()
+
+  await createCardPurchaseInternal({
+    userId,
+    amount: input.amount,
+    date: input.date,
+    description: input.description,
+    cardAccountId: input.originAccountId,
+    categoryId: input.categoryId,
+    subcategoryId: input.subcategoryId,
+    installments: input.installments,
+    firstInstallmentMonth: input.firstInstallmentMonth,
+    parcelValues: input.parcelValues,
+  })
+}
+
+export async function createInvoicePayment(
+  input: CreateInvoicePaymentInput
+): Promise<void> {
+  validateCreateInvoicePayment(input)
+
+  const userId = await getUserId()
+
+  const normalizedDescription =
+    normalizeText(input.description) ?? 'Pagamento de fatura'
+
+  const { data: movement, error: movementError } = await supabase
+    .from('movimentacoes')
+    .insert({
+      tipo: 'SAIDA',
+      valor: input.amount,
+      data: input.date,
+      descricao: normalizedDescription,
+      conta_origem_id: input.originAccountId,
+      conta_destino_id: null,
+      categoria_id: null,
+      subcategoria_id: null,
+      user_id: userId,
+    })
+    .select('id')
+    .single()
+
+  if (movementError || !movement) {
+    throw new Error('Erro ao registrar pagamento de fatura')
+  }
+
+  try {
+    await createCardPurchaseInternal({
+      userId,
+      amount: -Math.abs(input.amount),
+      date: input.date,
+      description: normalizedDescription,
+      cardAccountId: input.cardAccountId,
+      installments: 1,
+      firstInstallmentMonth: parseFirstInstallmentMonthFromDate(input.date),
+      parcelValues: [-Math.abs(input.amount)],
+    })
+  } catch {
+    await supabase
+      .from('movimentacoes')
+      .delete()
+      .eq('id', movement.id)
+      .eq('user_id', userId)
+
+    throw new Error('Erro ao registrar pagamento de fatura')
+  }
+}
+
+export async function createTransfer(
+  input: CreateTransferInput
+): Promise<void> {
+  validateCreateTransaction(input)
+
+  const userId = await getUserId()
+
+  const { error } = await supabase.from('movimentacoes').insert({
+    tipo: 'TRANSFERENCIA',
+    valor: input.amount,
+    data: input.date,
+    descricao: normalizeText(input.description),
+    conta_origem_id: input.originAccountId,
+    conta_destino_id: input.destinationAccountId,
+    categoria_id: null,
+    subcategoria_id: null,
+    user_id: userId,
+  })
+
+  if (error) throw new Error('Erro ao criar transferência')
+}
+
+export async function createTransaction(
+  input: CreateTransactionInput
+): Promise<void> {
+  if (input.type === 'TRANSFERENCIA') {
+    return createTransfer(input)
+  }
+
+  if (input.type === 'ENTRADA') {
+    return createIncome(input)
+  }
+
+  if (input.type === 'SAIDA') {
+    if (input.paymentMethod === 'CARTAO_CREDITO') {
+      return createCreditPurchase(input)
+    }
+
+    return createExpense(input)
+  }
+
+  throw new Error('Tipo inválido')
+}
+
 export async function listTimeline(): Promise<TimelineItem[]> {
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
+  const userId = await getUserId()
 
   const { data, error } = await supabase
     .from('vw_timeline')
@@ -274,16 +366,9 @@ export async function listTimeline(): Promise<TimelineItem[]> {
   return (data ?? []).map(mapTimelineRow)
 }
 
-/* =========================
-   DELETE TRANSACTION
-========================= */
-
 export async function getTransactionById(id: string) {
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
+  const userId = await getUserId()
 
-  // 1️⃣ Try movimentacoes first
   const { data: mov } = await supabase
     .from('movimentacoes')
     .select('*')
@@ -307,7 +392,6 @@ export async function getTransactionById(id: string) {
     }
   }
 
-  // 2️⃣ Try compras_cartao
   const { data: purchase } = await supabase
     .from('compras_cartao')
     .select('*')
@@ -352,10 +436,7 @@ export async function updateTransaction(
 ): Promise<void> {
   validateUpdateTransaction(input)
 
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
-
+  const userId = await getUserId()
   const { id, type } = input
 
   if (type === 'ENTRADA') {
@@ -406,6 +487,8 @@ export async function updateTransaction(
       parcelValues,
     } = input
 
+    validateParcelsSum(amount, parcelValues)
+
     const { error: updateError } = await supabase
       .from('compras_cartao')
       .update({
@@ -436,27 +519,11 @@ export async function updateTransaction(
       firstInstallmentMonth &&
       parcelValues
     ) {
-      const [year, month] = firstInstallmentMonth
-        .split('-')
-        .map(Number)
-
-      const parcels = parcelValues.map((value, index) => {
-        const competence = new Date(
-          year,
-          month - 1 + index,
-          1
-        )
-
-        const formatted = `${competence.getFullYear()}-${String(
-          competence.getMonth() + 1
-        ).padStart(2, '0')}-01`
-
-        return {
-          compra_cartao_id: id,
-          competencia: formatted,
-          valor: value,
-          user_id: userId,
-        }
+      const parcels = buildCardParcels({
+        purchaseId: id,
+        userId,
+        firstInstallmentMonth,
+        parcelValues,
       })
 
       const { error: parcelError } = await supabase
@@ -489,11 +556,8 @@ export async function updateTransaction(
 }
 
 export async function deleteTransaction(id: string): Promise<void> {
-  const { data: userData } = await supabase.auth.getUser()
-  const userId = userData.user?.id
-  if (!userId) throw new Error('Usuário não autenticado')
+  const userId = await getUserId()
 
-  // 1️⃣ Try delete from movimentacoes
   const { data: mov, error: movError } = await supabase
     .from('movimentacoes')
     .select('id')
@@ -519,7 +583,6 @@ export async function deleteTransaction(id: string): Promise<void> {
     return
   }
 
-  // 2️⃣ Try delete from compras_cartao
   const { data: purchase, error: purchaseError } = await supabase
     .from('compras_cartao')
     .select('id')
@@ -532,7 +595,6 @@ export async function deleteTransaction(id: string): Promise<void> {
   }
 
   if (purchase) {
-    // delete parcelas first
     const { error: parcelError } = await supabase
       .from('parcelas_cartao')
       .delete()
